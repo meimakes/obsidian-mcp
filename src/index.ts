@@ -23,6 +23,7 @@ const VAULT_PATH = process.env.VAULT_PATH;
 const PORT = parseInt(process.env.PORT ?? '3456', 10);
 const BIND_ADDRESS = process.env.BIND_ADDRESS ?? '127.0.0.1'; // #7: default to loopback
 const DAILY_NOTE_FOLDER = process.env.DAILY_NOTE_FOLDER ?? 'Journal';
+const DAILY_NOTE_FORMAT = process.env.DAILY_NOTE_FORMAT ?? 'YYYY-MM-DD'; // e.g. 'MM-DD-YYYY DayOfWeek'
 const AUTH_TOKEN = process.env.AUTH_TOKEN; // optional bearer token
 const MAX_BODY_SIZE = process.env.MAX_BODY_SIZE ?? '1mb'; // #6: request size limit
 
@@ -36,6 +37,7 @@ try {
   vault = new ObsidianVault({
     vaultPath: VAULT_PATH,
     dailyNoteFolder: DAILY_NOTE_FOLDER,
+    dailyNoteDateFormat: DAILY_NOTE_FORMAT,
   });
   console.log(`✅  Vault loaded: ${VAULT_PATH}`);
 } catch (err) {

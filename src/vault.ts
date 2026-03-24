@@ -85,7 +85,35 @@ export class ObsidianVault {
     const y = date.getFullYear();
     const m = String(date.getMonth() + 1).padStart(2, '0');
     const d = String(date.getDate()).padStart(2, '0');
-    return `${y}-${m}-${d}`;
+    const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const dayName = days[date.getDay()];
+
+    switch (this.dailyNoteDateFormat) {
+      case 'MM-DD-YYYY DayOfWeek':
+        return `${m}-${d}-${y} ${dayName}`;
+      case 'MM-DD-YYYY':
+        return `${m}-${d}-${y}`;
+      case 'YYYY-MM-DD':
+      default:
+        return `${y}-${m}-${d}`;
+    }
+  }
+
+  /** Parse a date string back from the configured format */
+  private parseFormattedDate(dateStr: string): Date | null {
+    // Try MM-DD-YYYY DayOfWeek format
+    const mdyDay = dateStr.match(/^(\d{2})-(\d{2})-(\d{4})\s+\w+$/);
+    if (mdyDay) return new Date(`${mdyDay[3]}-${mdyDay[1]}-${mdyDay[2]}T12:00:00`);
+
+    // Try MM-DD-YYYY format
+    const mdy = dateStr.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+    if (mdy) return new Date(`${mdy[3]}-${mdy[1]}-${mdy[2]}T12:00:00`);
+
+    // Try YYYY-MM-DD format
+    const ymd = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (ymd) return new Date(`${ymd[1]}-${ymd[2]}-${ymd[3]}T12:00:00`);
+
+    return null;
   }
 
   // ─── Notes ───────────────────────────────────────────────────────────────────
@@ -265,12 +293,23 @@ export class ObsidianVault {
     return path.join(this.dailyNoteFolder, `${dateStr}.md`);
   }
 
+  /** Parse a date string input, avoiding timezone pitfalls */
+  private parseDateInput(dateStr: string): Date {
+    const parsed = this.parseFormattedDate(dateStr);
+    if (parsed) return parsed;
+    // For bare YYYY-MM-DD strings, append T12:00:00 to avoid UTC midnight → previous day in local tz
+    if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+      return new Date(`${dateStr}T12:00:00`);
+    }
+    return new Date(dateStr);
+  }
+
   async getDailyNote(dateStr?: string): Promise<{
     path: string;
     exists: boolean;
     note?: NoteResult;
   }> {
-    const date = dateStr ? new Date(dateStr) : new Date();
+    const date = dateStr ? this.parseDateInput(dateStr) : new Date();
     const notePath = this.getDailyNotePath(date);
     const fullPath = this.resolvePath(notePath);
 
@@ -286,7 +325,7 @@ export class ObsidianVault {
     options: { dateStr?: string; template?: string; overwrite?: boolean } = {}
   ): Promise<{ path: string; created: boolean }> {
     const { dateStr, template, overwrite = false } = options;
-    const date = dateStr ? new Date(dateStr) : new Date();
+    const date = dateStr ? this.parseDateInput(dateStr) : new Date();
     const formattedDate = this.formatDate(date);
     const notePath = this.getDailyNotePath(date);
     const fullPath = this.resolvePath(notePath);
@@ -299,12 +338,9 @@ export class ObsidianVault {
       ? template
           .replace(/{{date}}/g, formattedDate)
           .replace(/{{title}}/g, formattedDate)
-      : `# ${formattedDate}\n\n## Notes\n\n## Tasks\n\n`;
+      : '';
 
-    return this.writeNote(notePath, content, {
-      date: formattedDate,
-      created: new Date().toISOString(),
-    }, { overwrite: true }); // daily note creation always allows overwrite when explicitly requested
+    return this.writeNote(notePath, content, undefined, { overwrite: true });
   }
 
   // ─── Sync Status ─────────────────────────────────────────────────────────────

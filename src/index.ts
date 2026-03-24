@@ -103,8 +103,10 @@ setInterval(() => {
   }
 }, 60_000);
 
-// ─── MCP Server ───────────────────────────────────────────────────────────────
+// ─── MCP Server Factory ──────────────────────────────────────────────────────
+// Each SSE connection gets its own McpServer instance (SDK requirement).
 
+function createServer(): McpServer {
 const server = new McpServer({
   name: 'obsidian-mcp',
   version: '1.0.0',
@@ -375,6 +377,9 @@ server.tool(
   }
 );
 
+return server;
+}
+
 // ─── HTTP / SSE Express Server ─────────────────────────────────────────────────
 
 const app = express();
@@ -390,7 +395,7 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', vault: VAULT_PATH, server: 'obsidian-mcp' });
 });
 
-// SSE transport — one connection per client
+// SSE transport — one connection per client, each with its own McpServer
 const transports: Record<string, SSEServerTransport> = {};
 
 app.get('/sse', authMiddleware, async (req, res) => {
@@ -398,12 +403,15 @@ app.get('/sse', authMiddleware, async (req, res) => {
   const transport = new SSEServerTransport('/messages', res);
   transports[transport.sessionId] = transport;
 
+  const sessionServer = createServer();
+
   res.on('close', () => {
     console.log(`← SSE disconnected: ${transport.sessionId}`);
     delete transports[transport.sessionId];
+    sessionServer.close().catch(() => {});
   });
 
-  await server.connect(transport);
+  await sessionServer.connect(transport);
 });
 
 // NOTE: do NOT use express.json() here — SSEServerTransport.handlePostMessage

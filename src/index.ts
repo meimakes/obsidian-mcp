@@ -465,16 +465,17 @@ app.get('/health', async (_req, res) => {
       const mdFiles = await glob('**/*.md', {
         cwd: VAULT_PATH!,
         ignore: ['**/.obsidian/**', '**/.trash/**'],
+        stat: true,
+        withFileTypes: true,
       });
       health.noteCount = mdFiles.length;
 
       // Find most recently modified file for sync freshness
+      // glob with stat:true already has stat info, no extra syscalls needed
       let latestMtime = 0;
       for (const f of mdFiles) {
-        try {
-          const stat = await fs.stat(path.join(VAULT_PATH!, f));
-          if (stat.mtimeMs > latestMtime) latestMtime = stat.mtimeMs;
-        } catch { /* skip */ }
+        const mtime = f.mtimeMs ?? 0;
+        if (mtime > latestMtime) latestMtime = mtime;
       }
       if (latestMtime > 0) {
         health.lastModified = new Date(latestMtime).toISOString();

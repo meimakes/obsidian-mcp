@@ -1,0 +1,65 @@
+# Combined container for Fly.io: obsidian-headless sync + obsidian-mcp
+# Uses s6-overlay to supervise both processes in a single container.
+#
+# Deploy: fly deploy --dockerfile Dockerfile.fly
+
+FROM node:20-slim AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:20-slim
+
+# Install s6-overlay for process supervision + curl for health checks
+ARG S6_OVERLAY_VERSION=3.2.0.2
+ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz /tmp
+ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-x86_64.tar.xz /tmp
+RUN tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz && \
+    tar -C / -Jxpf /tmp/s6-overlay-x86_64.tar.xz && \
+    rm /tmp/s6-overlay-*.tar.xz
+
+# Install obsidian-headless CLI
+RUN npm install -g obsidian-headless && npm cache clean --force
+
+# Copy built MCP server
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY package.json .
+
+# Create vault directory
+RUN mkdir -p /vault
+
+# s6 service: obsidian sync
+RUN mkdir -p /etc/s6-overlay/s6-rc.d/obsidian-sync /etc/s6-overlay/s6-rc.d/user/contents.d
+RUN echo "longrun" > /etc/s6-overlay/s6-rc.d/obsidian-sync/type
+RUN printf '#!/command/execlineb -P\ncd /vault\nob sync --continuous\n' > /etc/s6-overlay/s6-rc.d/obsidian-sync/run && \
+    chmod +x /etc/s6-overlay/s6-rc.d/obsidian-sync/run
+RUN touch /etc/s6-overlay/s6-rc.d/user/contents.d/obsidian-sync
+
+# s6 service: obsidian-mcp
+RUN mkdir -p /etc/s6-overlay/s6-rc.d/obsidian-mcp /etc/s6-overlay/s6-rc.d/obsidian-mcp/dependencies.d
+RUN echo "longrun" > /etc/s6-overlay/s6-rc.d/obsidian-mcp/type
+RUN printf '#!/command/execlineb -P\ncd /app\nnode dist/index.js\n' > /etc/s6-overlay/s6-rc.d/obsidian-mcp/run && \
+    chmod +x /etc/s6-overlay/s6-rc.d/obsidian-mcp/run
+RUN touch /etc/s6-overlay/s6-rc.d/user/contents.d/obsidian-mcp
+RUN touch /etc/s6-overlay/s6-rc.d/obsidian-mcp/dependencies.d/obsidian-sync
+
+# s6 init setup: login to Obsidian Sync on first run
+RUN mkdir -p /etc/s6-overlay/s6-rc.d/init-obsidian /etc/s6-overlay/s6-rc.d/init-obsidian/dependencies.d
+RUN echo "oneshot" > /etc/s6-overlay/s6-rc.d/init-obsidian/type
+RUN printf '#!/command/execlineb -P\nob login --auth-token ${OBSIDIAN_AUTH_TOKEN}\n' > /etc/s6-overlay/s6-rc.d/init-obsidian/up && \
+    chmod +x /etc/s6-overlay/s6-rc.d/init-obsidian/up
+RUN touch /etc/s6-overlay/s6-rc.d/user/contents.d/init-obsidian
+RUN touch /etc/s6-overlay/s6-rc.d/obsidian-sync/dependencies.d/init-obsidian 2>/dev/null; \
+    mkdir -p /etc/s6-overlay/s6-rc.d/obsidian-sync/dependencies.d && \
+    touch /etc/s6-overlay/s6-rc.d/obsidian-sync/dependencies.d/init-obsidian
+
+ENV VAULT_PATH=/vault
+ENV PORT=3456
+ENV BIND_ADDRESS=0.0.0.0
+EXPOSE 3456
+
+ENTRYPOINT ["/init"]

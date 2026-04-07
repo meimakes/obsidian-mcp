@@ -15,6 +15,10 @@ process.on('unhandledRejection', (reason) => {
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { z } from 'zod';
+import { existsSync } from 'fs';
+import { glob } from 'glob';
+import * as fs from 'fs/promises';
+import * as path from 'path';
 import { ObsidianVault } from './vault.js';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -26,24 +30,77 @@ const DAILY_NOTE_FOLDER = process.env.DAILY_NOTE_FOLDER ?? 'Journal';
 const DAILY_NOTE_FORMAT = process.env.DAILY_NOTE_FORMAT ?? 'YYYY-MM-DD'; // e.g. 'MM-DD-YYYY DayOfWeek'
 const AUTH_TOKEN = process.env.AUTH_TOKEN; // optional bearer token
 const MAX_BODY_SIZE = process.env.MAX_BODY_SIZE ?? '1mb'; // #6: request size limit
+const SYNC_WAIT_TIMEOUT = parseInt(process.env.SYNC_WAIT_TIMEOUT ?? '300', 10); // seconds
 
 if (!VAULT_PATH) {
   console.error('❌  VAULT_PATH env var is required');
   process.exit(1);
 }
 
+// ─── Startup: wait for vault to be synced ────────────────────────────────────
+
+const startTime = Date.now();
+let vaultReady = false;
 let vault: ObsidianVault;
-try {
-  vault = new ObsidianVault({
-    vaultPath: VAULT_PATH,
-    dailyNoteFolder: DAILY_NOTE_FOLDER,
-    dailyNoteDateFormat: DAILY_NOTE_FORMAT,
-  });
-  console.log(`✅  Vault loaded: ${VAULT_PATH}`);
-} catch (err) {
-  console.error('❌  Failed to initialize vault:', err);
+
+async function waitForVault(): Promise<void> {
+  // If vault path already exists, init immediately
+  if (existsSync(VAULT_PATH!)) {
+    vault = new ObsidianVault({
+      vaultPath: VAULT_PATH!,
+      dailyNoteFolder: DAILY_NOTE_FOLDER,
+      dailyNoteDateFormat: DAILY_NOTE_FORMAT,
+    });
+    vaultReady = true;
+    console.log(`✅  Vault loaded: ${VAULT_PATH}`);
+    return;
+  }
+
+  // Wait for vault path to appear (sync container may still be downloading)
+  console.log(`⏳  Waiting for vault at ${VAULT_PATH} (sync may still be in progress)...`);
+  const deadline = Date.now() + SYNC_WAIT_TIMEOUT * 1000;
+
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 3000));
+
+    if (existsSync(VAULT_PATH!)) {
+      // Check if there's at least one .md file (initial sync might still be creating the dir)
+      const mdFiles = await glob('**/*.md', {
+        cwd: VAULT_PATH!,
+        ignore: ['**/.obsidian/**', '**/.trash/**'],
+      }).catch(() => []);
+
+      if (mdFiles.length > 0) {
+        vault = new ObsidianVault({
+          vaultPath: VAULT_PATH!,
+          dailyNoteFolder: DAILY_NOTE_FOLDER,
+          dailyNoteDateFormat: DAILY_NOTE_FORMAT,
+        });
+        vaultReady = true;
+        console.log(`✅  Vault synced and loaded: ${VAULT_PATH} (${mdFiles.length} notes)`);
+        return;
+      }
+      console.log(`⏳  Vault directory exists but no .md files yet, waiting...`);
+    }
+  }
+
+  // Timeout — start anyway if directory exists (might be an empty vault)
+  if (existsSync(VAULT_PATH!)) {
+    vault = new ObsidianVault({
+      vaultPath: VAULT_PATH!,
+      dailyNoteFolder: DAILY_NOTE_FOLDER,
+      dailyNoteDateFormat: DAILY_NOTE_FORMAT,
+    });
+    vaultReady = true;
+    console.log(`⚠️  Vault loaded after timeout (may still be syncing): ${VAULT_PATH}`);
+    return;
+  }
+
+  console.error(`❌  Vault path ${VAULT_PATH} did not appear within ${SYNC_WAIT_TIMEOUT}s`);
   process.exit(1);
 }
+
+await waitForVault();
 
 // ─── Auth Middleware ───────────────────────────────────────────────────────────
 
@@ -393,8 +450,42 @@ app.use('/health', express.json({ limit: MAX_BODY_SIZE }));
 app.use(rateLimitMiddleware);
 
 // Health check (unauthenticated — useful for uptime monitoring)
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', vault: VAULT_PATH, server: 'obsidian-mcp' });
+app.get('/health', async (_req, res) => {
+  const uptimeMs = Date.now() - startTime;
+  const uptimeMin = Math.floor(uptimeMs / 60_000);
+  const health: Record<string, unknown> = {
+    status: vaultReady ? 'ok' : 'waiting_for_sync',
+    server: 'obsidian-mcp',
+    vault: VAULT_PATH,
+    vaultExists: existsSync(VAULT_PATH!),
+    uptime: `${uptimeMin}m`,
+  };
+
+  if (vaultReady) {
+    try {
+      const mdFiles = await glob('**/*.md', {
+        cwd: VAULT_PATH!,
+        ignore: ['**/.obsidian/**', '**/.trash/**'],
+      });
+      health.noteCount = mdFiles.length;
+
+      // Find most recently modified file for sync freshness
+      let latestMtime = 0;
+      for (const f of mdFiles.slice(0, 50)) { // sample first 50 for perf
+        try {
+          const stat = await fs.stat(path.join(VAULT_PATH!, f));
+          if (stat.mtimeMs > latestMtime) latestMtime = stat.mtimeMs;
+        } catch { /* skip */ }
+      }
+      if (latestMtime > 0) {
+        health.lastModified = new Date(latestMtime).toISOString();
+      }
+    } catch {
+      health.noteCount = 'unavailable';
+    }
+  }
+
+  res.json(health);
 });
 
 // SSE transport — one connection per client, each with its own McpServer

@@ -1,0 +1,42 @@
+# Cloud mode: obsidian-mcp + Obsidian Headless Sync
+# Usage: cp .env.example .env  →  fill in values  →  docker compose up -d
+#
+# The sync container keeps /vault in sync with your Obsidian Sync vault.
+# obsidian-mcp reads/writes the same /vault directory.
+
+services:
+  sync:
+    image: ghcr.io/belphemur/obsidian-headless-sync-docker:latest
+    environment:
+      OBSIDIAN_AUTH_TOKEN: ${OBSIDIAN_AUTH_TOKEN}
+      VAULT_NAME: ${VAULT_NAME}
+      VAULT_PASSWORD: ${VAULT_PASSWORD:-}
+      DEVICE_NAME: ${DEVICE_NAME:-obsidian-mcp-cloud}
+      CONFLICT_STRATEGY: merge
+      PUID: "1000"
+      PGID: "1000"
+    volumes:
+      - vault-data:/vault
+      - sync-config:/home/obsidian/.config
+    restart: unless-stopped
+
+  mcp:
+    build: .
+    ports:
+      - "${PORT:-3456}:${PORT:-3456}"
+    environment:
+      VAULT_PATH: /vault
+      PORT: ${PORT:-3456}
+      BIND_ADDRESS: "0.0.0.0"
+      DAILY_NOTE_FOLDER: ${DAILY_NOTE_FOLDER:-Journal}
+      DAILY_NOTE_FORMAT: ${DAILY_NOTE_FORMAT:-YYYY-MM-DD}
+      AUTH_TOKEN: ${AUTH_TOKEN:-}
+    volumes:
+      - vault-data:/vault
+    depends_on:
+      - sync
+    restart: unless-stopped
+
+volumes:
+  vault-data:
+  sync-config:

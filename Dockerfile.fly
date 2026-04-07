@@ -12,7 +12,7 @@ RUN npm run build
 
 FROM node:20-slim
 
-# Install s6-overlay for process supervision + curl for health checks
+# Install s6-overlay for process supervision
 ARG S6_OVERLAY_VERSION=3.2.0.2
 ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz /tmp
 ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-x86_64.tar.xz /tmp
@@ -32,31 +32,54 @@ COPY package.json .
 # Create vault directory
 RUN mkdir -p /vault
 
-# s6 service: obsidian sync
-RUN mkdir -p /etc/s6-overlay/s6-rc.d/obsidian-sync /etc/s6-overlay/s6-rc.d/user/contents.d
-RUN echo "longrun" > /etc/s6-overlay/s6-rc.d/obsidian-sync/type
-RUN printf '#!/command/execlineb -P\ncd /vault\nob sync --continuous\n' > /etc/s6-overlay/s6-rc.d/obsidian-sync/run && \
-    chmod +x /etc/s6-overlay/s6-rc.d/obsidian-sync/run
-RUN touch /etc/s6-overlay/s6-rc.d/user/contents.d/obsidian-sync
+# ─── s6 oneshot: login + vault setup ─────────────────────────────────────────
+RUN mkdir -p /etc/s6-overlay/s6-rc.d/init-obsidian \
+             /etc/s6-overlay/s6-rc.d/user/contents.d
+RUN echo "oneshot" > /etc/s6-overlay/s6-rc.d/init-obsidian/type
+COPY <<'INITSCRIPT' /etc/s6-overlay/s6-rc.d/init-obsidian/up
+#!/bin/sh
+set -e
+echo "[init] Logging in to Obsidian Sync..."
+ob login --auth-token "$OBSIDIAN_AUTH_TOKEN"
+echo "[init] Setting up vault: $VAULT_NAME"
+cd /vault
+ob sync-setup --vault "$VAULT_NAME"
+if [ -n "$VAULT_PASSWORD" ]; then
+  echo "[init] Configuring E2E encryption"
+  ob sync-setup --vault "$VAULT_NAME" --password "$VAULT_PASSWORD"
+fi
+echo "[init] Setup complete"
+INITSCRIPT
+RUN chmod +x /etc/s6-overlay/s6-rc.d/init-obsidian/up
+RUN touch /etc/s6-overlay/s6-rc.d/user/contents.d/init-obsidian
 
-# s6 service: obsidian-mcp
-RUN mkdir -p /etc/s6-overlay/s6-rc.d/obsidian-mcp /etc/s6-overlay/s6-rc.d/obsidian-mcp/dependencies.d
+# ─── s6 longrun: obsidian sync ───────────────────────────────────────────────
+RUN mkdir -p /etc/s6-overlay/s6-rc.d/obsidian-sync \
+             /etc/s6-overlay/s6-rc.d/obsidian-sync/dependencies.d
+RUN echo "longrun" > /etc/s6-overlay/s6-rc.d/obsidian-sync/type
+COPY <<'SYNCSCRIPT' /etc/s6-overlay/s6-rc.d/obsidian-sync/run
+#!/bin/sh
+cd /vault
+exec ob sync --continuous
+SYNCSCRIPT
+RUN chmod +x /etc/s6-overlay/s6-rc.d/obsidian-sync/run
+RUN touch /etc/s6-overlay/s6-rc.d/user/contents.d/obsidian-sync
+RUN touch /etc/s6-overlay/s6-rc.d/obsidian-sync/dependencies.d/init-obsidian
+
+# ─── s6 longrun: obsidian-mcp ────────────────────────────────────────────────
+RUN mkdir -p /etc/s6-overlay/s6-rc.d/obsidian-mcp \
+             /etc/s6-overlay/s6-rc.d/obsidian-mcp/dependencies.d
 RUN echo "longrun" > /etc/s6-overlay/s6-rc.d/obsidian-mcp/type
-RUN printf '#!/command/execlineb -P\ncd /app\nnode dist/index.js\n' > /etc/s6-overlay/s6-rc.d/obsidian-mcp/run && \
-    chmod +x /etc/s6-overlay/s6-rc.d/obsidian-mcp/run
+COPY <<'MCPSCRIPT' /etc/s6-overlay/s6-rc.d/obsidian-mcp/run
+#!/bin/sh
+cd /app
+exec node dist/index.js
+MCPSCRIPT
+RUN chmod +x /etc/s6-overlay/s6-rc.d/obsidian-mcp/run
 RUN touch /etc/s6-overlay/s6-rc.d/user/contents.d/obsidian-mcp
 RUN touch /etc/s6-overlay/s6-rc.d/obsidian-mcp/dependencies.d/obsidian-sync
 
-# s6 init setup: login to Obsidian Sync on first run
-RUN mkdir -p /etc/s6-overlay/s6-rc.d/init-obsidian /etc/s6-overlay/s6-rc.d/init-obsidian/dependencies.d
-RUN echo "oneshot" > /etc/s6-overlay/s6-rc.d/init-obsidian/type
-RUN printf '#!/command/execlineb -P\nob login --auth-token ${OBSIDIAN_AUTH_TOKEN}\n' > /etc/s6-overlay/s6-rc.d/init-obsidian/up && \
-    chmod +x /etc/s6-overlay/s6-rc.d/init-obsidian/up
-RUN touch /etc/s6-overlay/s6-rc.d/user/contents.d/init-obsidian
-RUN touch /etc/s6-overlay/s6-rc.d/obsidian-sync/dependencies.d/init-obsidian 2>/dev/null; \
-    mkdir -p /etc/s6-overlay/s6-rc.d/obsidian-sync/dependencies.d && \
-    touch /etc/s6-overlay/s6-rc.d/obsidian-sync/dependencies.d/init-obsidian
-
+ENV S6_BEHAVIOUR_IF_STAGE2_FAILS=2
 ENV VAULT_PATH=/vault
 ENV PORT=3456
 ENV BIND_ADDRESS=0.0.0.0

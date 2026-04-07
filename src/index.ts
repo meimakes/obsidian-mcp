@@ -456,7 +456,6 @@ app.get('/health', async (_req, res) => {
   const health: Record<string, unknown> = {
     status: vaultReady ? 'ok' : 'waiting_for_sync',
     server: 'obsidian-mcp',
-    vault: VAULT_PATH,
     vaultExists: existsSync(VAULT_PATH!),
     uptime: `${uptimeMin}m`,
   };
@@ -471,7 +470,7 @@ app.get('/health', async (_req, res) => {
 
       // Find most recently modified file for sync freshness
       let latestMtime = 0;
-      for (const f of mdFiles.slice(0, 50)) { // sample first 50 for perf
+      for (const f of mdFiles) {
         try {
           const stat = await fs.stat(path.join(VAULT_PATH!, f));
           if (stat.mtimeMs > latestMtime) latestMtime = stat.mtimeMs;

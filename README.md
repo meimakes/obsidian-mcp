@@ -149,6 +149,7 @@ This is the same sync mechanism Obsidian uses — version history is preserved, 
 | `read_note` | Read a note's content and frontmatter |
 | `write_note` | Create or overwrite a note (auto-backup on overwrite) |
 | `append_note` | Append text to an existing note |
+| `edit_note` | Find and replace a unique text string within a note (auto-backup) |
 | `delete_note` | Soft-delete to .trash/ (or permanent with flag) |
 | `search_vault` | Full-text search across all notes |
 | `list_tags` | List all tags and which notes use them |

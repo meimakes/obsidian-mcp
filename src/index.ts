@@ -35,6 +35,9 @@ const DAILY_NOTE_FOLDER = process.env.DAILY_NOTE_FOLDER ?? 'Journal';
 const DAILY_NOTE_FORMAT = process.env.DAILY_NOTE_FORMAT ?? 'YYYY-MM-DD'; // e.g. 'MM-DD-YYYY DayOfWeek'
 const AUTH_TOKEN = process.env.AUTH_TOKEN; // optional bearer token
 const MAX_BODY_SIZE = process.env.MAX_BODY_SIZE ?? '1mb'; // #6: request size limit
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
+  : [];
 const SYNC_WAIT_TIMEOUT = parseInt(process.env.SYNC_WAIT_TIMEOUT ?? '300', 10); // seconds
 
 if (!VAULT_PATH) {
@@ -501,15 +504,17 @@ return server;
 
 const app = express();
 
-// #6: Body size limit for non-SSE routes
-app.use('/health', express.json({ limit: MAX_BODY_SIZE }));
-
-// #3: Rate limiting on all authenticated routes
-app.use(rateLimitMiddleware);
-
 // ─── Origin Validation ────────────────────────────────────────────────────────
-// The MCP spec (2025-03-26) recommends validating the Origin header to prevent
-// DNS rebinding attacks on locally-running servers.
+// The MCP spec (2025-03-26, §Streamable HTTP) requires servers to validate the
+// Origin header to prevent DNS rebinding attacks. Registered first so invalid
+// origins are rejected before auth or rate-limit processing.
+
+const allowedOriginHostnames = new Set([
+  'localhost',
+  '127.0.0.1',
+  '::1',
+  ...ALLOWED_ORIGINS,
+]);
 
 function originCheckMiddleware(
   req: express.Request,
@@ -517,28 +522,28 @@ function originCheckMiddleware(
   next: express.NextFunction
 ) {
   const origin = req.headers.origin;
-  // If there's no Origin header, this is not a browser-initiated request — allow it.
+  // No Origin header → non-browser client (CLI, MCP SDK, etc.) — allow.
   if (!origin) return next();
 
-  // Allow requests from the same host the server is bound to
   try {
-    const url = new URL(origin);
-    const allowed = [
-      'localhost',
-      '127.0.0.1',
-      `${BIND_ADDRESS}`,
-    ];
-    if (allowed.includes(url.hostname) || url.hostname.endsWith('.ts.net')) {
+    const { hostname } = new URL(origin);
+    if (allowedOriginHostnames.has(hostname) || hostname.endsWith('.ts.net')) {
       return next();
     }
   } catch {
-    // Malformed Origin — reject
+    // Malformed Origin — fall through to reject
   }
 
   res.status(403).json({ error: 'Forbidden: origin not allowed' });
 }
 
 app.use(originCheckMiddleware);
+
+// #6: Body size limit for non-SSE routes
+app.use('/health', express.json({ limit: MAX_BODY_SIZE }));
+
+// #3: Rate limiting on all authenticated routes
+app.use(rateLimitMiddleware);
 
 // Health check (unauthenticated — useful for uptime monitoring)
 app.get('/health', async (_req, res) => {

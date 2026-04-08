@@ -1,16 +1,21 @@
 import 'dotenv/config';
 import express from 'express';
+import { timingSafeEqual } from 'crypto';
 
 // ─── Crash Protection ────────────────────────────────────────────────────────
-// Prevent the process from dying on unhandled errors
+// Log unhandled errors and exit. The process manager (pm2, Docker, s6) should
+// handle restarts. Continuing after an uncaught exception risks running in an
+// undefined state which could compromise security invariants.
 
 process.on('uncaughtException', (err) => {
   console.error(`[crash-guard] Uncaught exception: ${err.message}`);
   console.error(err.stack);
+  process.exit(1);
 });
 
 process.on('unhandledRejection', (reason) => {
   console.error(`[crash-guard] Unhandled rejection:`, reason);
+  process.exit(1);
 });
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
@@ -117,7 +122,14 @@ function authMiddleware(
 ) {
   if (!AUTH_TOKEN) return next(); // no auth configured → open (rely on network-level security)
   const header = req.headers.authorization ?? '';
-  if (header === `Bearer ${AUTH_TOKEN}`) return next();
+  const expected = `Bearer ${AUTH_TOKEN}`;
+  // Use timing-safe comparison to prevent token recovery via response-time analysis
+  if (
+    header.length === expected.length &&
+    timingSafeEqual(Buffer.from(header), Buffer.from(expected))
+  ) {
+    return next();
+  }
   res.status(401).json({ error: 'Unauthorized' });
 }
 
@@ -255,6 +267,7 @@ server.tool(
 );
 
 // ── upload_attachment ─────────────────────────────────────────────────────────
+// ── upload_attachment ─────────────────────────────────────────────────────
 server.tool(
   'upload_attachment',
   'Upload a binary file (image, PDF, etc.) to the vault from base64-encoded data.',
@@ -269,37 +282,20 @@ server.tool(
   },
   async ({ path: filePath, data, overwrite }, extra) => {
     const v = requireVault();
-    const vaultPath = (v as any).vaultPath as string;
-    const resolved = path.resolve(vaultPath, filePath);
-
-    // Path traversal protection
-    if (!resolved.startsWith(vaultPath + path.sep) && resolved !== vaultPath) {
-      throw new Error(`Path traversal attempt blocked: ${filePath}`);
-    }
-
-    if (existsSync(resolved) && !overwrite) {
-      throw new Error(`File already exists: ${filePath}. Set overwrite: true to replace.`);
-    }
-
-    // Ensure parent directory exists
-    await fs.mkdir(path.dirname(resolved), { recursive: true });
-
-    // Decode base64 and write
     const buffer = Buffer.from(data, 'base64');
-    await fs.writeFile(resolved, buffer);
+    const result = await v.uploadAttachment(filePath, buffer, { overwrite });
 
     auditLog('UPLOAD', filePath, extra.sessionId);
     return {
       content: [
         {
           type: 'text',
-          text: `✅ Uploaded: ${filePath} (${buffer.length} bytes)`,
+          text: `✅ Uploaded: ${result.path} (${result.bytes} bytes)`,
         },
       ],
     };
   }
 );
-
 // ── append_note ───────────────────────────────────────────────────────────────
 server.tool(
   'append_note',
@@ -508,6 +504,39 @@ app.use('/health', express.json({ limit: MAX_BODY_SIZE }));
 
 // #3: Rate limiting on all authenticated routes
 app.use(rateLimitMiddleware);
+
+// ─── Origin Validation ────────────────────────────────────────────────────────
+// The MCP spec (2025-03-26) recommends validating the Origin header to prevent
+// DNS rebinding attacks on locally-running servers.
+
+function originCheckMiddleware(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  const origin = req.headers.origin;
+  // If there's no Origin header, this is not a browser-initiated request — allow it.
+  if (!origin) return next();
+
+  // Allow requests from the same host the server is bound to
+  try {
+    const url = new URL(origin);
+    const allowed = [
+      'localhost',
+      '127.0.0.1',
+      `${BIND_ADDRESS}`,
+    ];
+    if (allowed.includes(url.hostname) || url.hostname.endsWith('.ts.net')) {
+      return next();
+    }
+  } catch {
+    // Malformed Origin — reject
+  }
+
+  res.status(403).json({ error: 'Forbidden: origin not allowed' });
+}
+
+app.use(originCheckMiddleware);
 
 // Health check (unauthenticated — useful for uptime monitoring)
 app.get('/health', async (_req, res) => {

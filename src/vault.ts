@@ -209,6 +209,24 @@ export class ObsidianVault {
     return { path: notePath, trashPath: trashRelPath };
   }
 
+  // ─── Attachments ─────────────────────────────────────────────────────────────
+
+  async uploadAttachment(
+    filePath: string,
+    data: Buffer,
+    options: { overwrite?: boolean } = {}
+  ): Promise<{ path: string; bytes: number }> {
+    const resolved = this.resolvePath(filePath);
+
+    if (existsSync(resolved) && !options.overwrite) {
+      throw new Error(`File already exists: ${filePath}. Set overwrite: true to replace.`);
+    }
+
+    await fs.mkdir(path.dirname(resolved), { recursive: true });
+    await fs.writeFile(resolved, data);
+    return { path: filePath, bytes: data.length };
+  }
+
   // ─── Search ──────────────────────────────────────────────────────────────────
 
   async searchVault(

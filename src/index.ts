@@ -124,9 +124,11 @@ function authMiddleware(
   const header = req.headers.authorization ?? '';
   const expected = `Bearer ${AUTH_TOKEN}`;
   // Use timing-safe comparison to prevent token recovery via response-time analysis
+  const headerBuf = Buffer.from(header);
+  const expectedBuf = Buffer.from(expected);
   if (
-    header.length === expected.length &&
-    timingSafeEqual(Buffer.from(header), Buffer.from(expected))
+    headerBuf.length === expectedBuf.length &&
+    timingSafeEqual(headerBuf, expectedBuf)
   ) {
     return next();
   }
@@ -267,7 +269,6 @@ server.tool(
 );
 
 // ── upload_attachment ─────────────────────────────────────────────────────────
-// ── upload_attachment ─────────────────────────────────────────────────────
 server.tool(
   'upload_attachment',
   'Upload a binary file (image, PDF, etc.) to the vault from base64-encoded data.',
@@ -296,6 +297,7 @@ server.tool(
     };
   }
 );
+
 // ── append_note ───────────────────────────────────────────────────────────────
 server.tool(
   'append_note',

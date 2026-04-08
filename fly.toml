@@ -1,0 +1,55 @@
+# Fly.io deployment for obsidian-mcp + Obsidian Headless Sync
+#
+# Setup:
+#   1. fly launch --no-deploy
+#   2. fly volumes create vault_data --size 1 --region sjc
+#   3. fly secrets set \
+#        OBSIDIAN_AUTH_TOKEN=<your-token> \
+#        AUTH_TOKEN=$(openssl rand -hex 32) \
+#        VAULT_NAME=<your-vault-name>
+#   4. fly deploy --dockerfile Dockerfile.fly
+#
+# Get your Obsidian auth token:
+#   docker run --rm -it --entrypoint get-token ghcr.io/belphemur/obsidian-headless-sync-docker:latest
+#
+# Cost: ~$3-5/month (shared-cpu-1x, 256MB RAM, 1GB volume)
+
+app = "obsidian-mcp"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile.fly"
+
+[env]
+  PORT = "3456"
+  BIND_ADDRESS = "0.0.0.0"
+  VAULT_PATH = "/vault"
+  SYNC_WAIT_TIMEOUT = "120"
+
+[mounts]
+  source = "vault_data"
+  destination = "/vault"
+
+[http_service]
+  internal_port = 3456
+  force_https = true
+  # Keep the machine running — the sync process must stay active to keep the vault current.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 50
+    soft_limit = 25
+
+[[http_service.checks]]
+  grace_period = "120s"
+  interval = "30s"
+  method = "GET"
+  timeout = "5s"
+  path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

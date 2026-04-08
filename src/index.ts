@@ -15,6 +15,10 @@ process.on('unhandledRejection', (reason) => {
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { z } from 'zod';
+import { existsSync } from 'fs';
+import { glob } from 'glob';
+import * as fs from 'fs/promises';
+import * as path from 'path';
 import { ObsidianVault } from './vault.js';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -26,24 +30,83 @@ const DAILY_NOTE_FOLDER = process.env.DAILY_NOTE_FOLDER ?? 'Journal';
 const DAILY_NOTE_FORMAT = process.env.DAILY_NOTE_FORMAT ?? 'YYYY-MM-DD'; // e.g. 'MM-DD-YYYY DayOfWeek'
 const AUTH_TOKEN = process.env.AUTH_TOKEN; // optional bearer token
 const MAX_BODY_SIZE = process.env.MAX_BODY_SIZE ?? '1mb'; // #6: request size limit
+const SYNC_WAIT_TIMEOUT = parseInt(process.env.SYNC_WAIT_TIMEOUT ?? '300', 10); // seconds
 
 if (!VAULT_PATH) {
   console.error('❌  VAULT_PATH env var is required');
   process.exit(1);
 }
 
+// ─── Startup: wait for vault to be synced ────────────────────────────────────
+
+const startTime = Date.now();
+let vaultReady = false;
 let vault: ObsidianVault;
-try {
-  vault = new ObsidianVault({
-    vaultPath: VAULT_PATH,
-    dailyNoteFolder: DAILY_NOTE_FOLDER,
-    dailyNoteDateFormat: DAILY_NOTE_FORMAT,
-  });
-  console.log(`✅  Vault loaded: ${VAULT_PATH}`);
-} catch (err) {
-  console.error('❌  Failed to initialize vault:', err);
+
+async function waitForVault(): Promise<void> {
+  // If vault path already exists, init immediately
+  if (existsSync(VAULT_PATH!)) {
+    vault = new ObsidianVault({
+      vaultPath: VAULT_PATH!,
+      dailyNoteFolder: DAILY_NOTE_FOLDER,
+      dailyNoteDateFormat: DAILY_NOTE_FORMAT,
+    });
+    vaultReady = true;
+    console.log(`✅  Vault loaded: ${VAULT_PATH}`);
+    return;
+  }
+
+  // Wait for vault path to appear (sync container may still be downloading)
+  console.log(`⏳  Waiting for vault at ${VAULT_PATH} (sync may still be in progress)...`);
+  const deadline = Date.now() + SYNC_WAIT_TIMEOUT * 1000;
+  let waitLoops = 0;
+
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 3000));
+    waitLoops++;
+
+    if (existsSync(VAULT_PATH!)) {
+      // Check if there's at least one .md file (initial sync might still be creating the dir)
+      const mdFiles = await glob('**/*.md', {
+        cwd: VAULT_PATH!,
+        ignore: ['**/.obsidian/**', '**/.trash/**'],
+      }).catch(() => []);
+
+      if (mdFiles.length > 0) {
+        vault = new ObsidianVault({
+          vaultPath: VAULT_PATH!,
+          dailyNoteFolder: DAILY_NOTE_FOLDER,
+          dailyNoteDateFormat: DAILY_NOTE_FORMAT,
+        });
+        vaultReady = true;
+        console.log(`✅  Vault synced and loaded: ${VAULT_PATH} (${mdFiles.length} notes)`);
+        return;
+      }
+      // Log every 5th iteration (~15s) to avoid spam
+      if (waitLoops % 5 === 0) {
+        console.log(`⏳  Vault directory exists but no .md files yet, waiting...`);
+      }
+    }
+  }
+
+  // Timeout — start anyway if directory exists (might be an empty vault)
+  if (existsSync(VAULT_PATH!)) {
+    vault = new ObsidianVault({
+      vaultPath: VAULT_PATH!,
+      dailyNoteFolder: DAILY_NOTE_FOLDER,
+      dailyNoteDateFormat: DAILY_NOTE_FORMAT,
+    });
+    vaultReady = true;
+    console.log(`⚠️  Vault loaded after timeout (may still be syncing): ${VAULT_PATH}`);
+    return;
+  }
+
+  console.error(`❌  Vault path ${VAULT_PATH} did not appear within ${SYNC_WAIT_TIMEOUT}s`);
   process.exit(1);
 }
+
+// Vault init runs after the HTTP server starts (see bottom of file).
+// This ensures /health responds during the sync wait period.
 
 // ─── Auth Middleware ───────────────────────────────────────────────────────────
 
@@ -108,6 +171,13 @@ setInterval(() => {
 // ─── MCP Server Factory ──────────────────────────────────────────────────────
 // Each SSE connection gets its own McpServer instance (SDK requirement).
 
+function requireVault(): ObsidianVault {
+  if (!vaultReady) {
+    throw new Error('Vault not yet synced — waiting for Obsidian Sync to complete initial download.');
+  }
+  return vault;
+}
+
 function createServer(): McpServer {
 const server = new McpServer({
   name: 'obsidian-mcp',
@@ -120,7 +190,8 @@ server.tool(
   'List all markdown notes in the vault, optionally filtered to a folder',
   { folder: z.string().optional().describe('Subfolder path relative to vault root') },
   async ({ folder }) => {
-    const notes = await vault.listNotes(folder);
+    const v = requireVault();
+    const notes = await v.listNotes(folder);
     return {
       content: [{ type: 'text', text: notes.join('\n') || '(no notes found)' }],
     };
@@ -133,7 +204,7 @@ server.tool(
   'Read the full content and frontmatter of a note',
   { path: z.string().describe('Path to note relative to vault root, e.g. "Journal/2025-01-01.md"') },
   async ({ path }) => {
-    const note = await vault.readNote(path);
+    const note = await requireVault().readNote(path);
     const fmStr =
       Object.keys(note.frontmatter).length > 0
         ? `---\n${JSON.stringify(note.frontmatter, null, 2)}\n---\n\n`
@@ -163,7 +234,7 @@ server.tool(
       .describe('Must be true to overwrite an existing note. A .bak backup is created automatically.'),
   },
   async ({ path, content, frontmatter, overwrite }, extra) => {
-    const result = await vault.writeNote(
+    const result = await requireVault().writeNote(
       path,
       content,
       frontmatter as Record<string, unknown> | undefined,
@@ -192,7 +263,7 @@ server.tool(
     content: z.string().describe('Text to append'),
   },
   async ({ path, content }, extra) => {
-    await vault.appendNote(path, content);
+    await requireVault().appendNote(path, content);
     auditLog('APPEND', path, extra.sessionId);
     return {
       content: [{ type: 'text', text: `✅ Appended to ${path}` }],
@@ -210,7 +281,7 @@ server.tool(
     permanent: z.boolean().optional().default(false).describe('If true, permanently deletes instead of moving to .trash/'),
   },
   async ({ path, permanent }, extra) => {
-    const result = await vault.deleteNote(path, { permanent });
+    const result = await requireVault().deleteNote(path, { permanent });
     auditLog(permanent ? 'DELETE-PERMANENT' : 'DELETE-SOFT', path, extra.sessionId);
     return {
       content: [{
@@ -234,7 +305,7 @@ server.tool(
     maxResults: z.number().optional().default(20),
   },
   async ({ query, folder, caseSensitive, maxResults }) => {
-    const results = await vault.searchVault(query, { folder, caseSensitive, maxResults });
+    const results = await requireVault().searchVault(query, { folder, caseSensitive, maxResults });
     if (results.length === 0) {
       return { content: [{ type: 'text', text: `No results for "${query}"` }] };
     }
@@ -255,7 +326,7 @@ server.tool(
   'List all tags used in the vault and which notes use each tag',
   {},
   async () => {
-    const tags = await vault.listTags();
+    const tags = await requireVault().listTags();
     const entries = Object.entries(tags);
     if (entries.length === 0) {
       return { content: [{ type: 'text', text: 'No tags found.' }] };
@@ -278,7 +349,7 @@ server.tool(
       .describe('ISO date string, e.g. "2025-06-15". Defaults to today.'),
   },
   async ({ date }) => {
-    const result = await vault.getDailyNote(date);
+    const result = await requireVault().getDailyNote(date);
     if (!result.exists) {
       return {
         content: [
@@ -319,7 +390,7 @@ server.tool(
       .describe('Overwrite if note already exists'),
   },
   async ({ date, template, overwrite }) => {
-    const result = await vault.createDailyNote({ dateStr: date, template, overwrite });
+    const result = await requireVault().createDailyNote({ dateStr: date, template, overwrite });
     return {
       content: [
         {
@@ -339,7 +410,7 @@ server.tool(
   'Check Obsidian Sync status — conflicts, recently modified files, and sync log',
   {},
   async () => {
-    const status = await vault.getSyncStatus();
+    const status = await requireVault().getSyncStatus();
 
     const lines: string[] = [];
 
@@ -393,8 +464,42 @@ app.use('/health', express.json({ limit: MAX_BODY_SIZE }));
 app.use(rateLimitMiddleware);
 
 // Health check (unauthenticated — useful for uptime monitoring)
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', vault: VAULT_PATH, server: 'obsidian-mcp' });
+app.get('/health', async (_req, res) => {
+  const uptimeMs = Date.now() - startTime;
+  const uptimeMin = Math.floor(uptimeMs / 60_000);
+  const health: Record<string, unknown> = {
+    status: vaultReady ? 'ok' : 'waiting_for_sync',
+    server: 'obsidian-mcp',
+    vaultExists: existsSync(VAULT_PATH!),
+    uptime: `${uptimeMin}m`,
+  };
+
+  if (vaultReady) {
+    try {
+      const mdFiles = await glob('**/*.md', {
+        cwd: VAULT_PATH!,
+        ignore: ['**/.obsidian/**', '**/.trash/**'],
+        stat: true,
+        withFileTypes: true,
+      });
+      health.noteCount = mdFiles.length;
+
+      // Find most recently modified file for sync freshness
+      // glob with stat:true already has stat info, no extra syscalls needed
+      let latestMtime = 0;
+      for (const f of mdFiles) {
+        const mtime = f.mtimeMs ?? 0;
+        if (mtime > latestMtime) latestMtime = mtime;
+      }
+      if (latestMtime > 0) {
+        health.lastModified = new Date(latestMtime).toISOString();
+      }
+    } catch {
+      health.noteCount = 'unavailable';
+    }
+  }
+
+  res.json(health);
 });
 
 // SSE transport — one connection per client, each with its own McpServer
@@ -453,4 +558,11 @@ app.listen(PORT, BIND_ADDRESS, () => {
     console.log(`   Set AUTH_TOKEN in .env for security.\n`);
   }
   console.log('');
+
+  // Initialize vault after the HTTP server is listening.
+  // This ensures /health responds during the sync wait period (important for Fly.io health checks).
+  waitForVault().catch(err => {
+    console.error('❌  Failed to initialize vault:', err);
+    process.exit(1);
+  });
 });

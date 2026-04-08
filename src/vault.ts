@@ -70,9 +70,12 @@ export class ObsidianVault {
       throw new Error(`Path traversal attempt blocked: ${notePath}`);
     }
 
-    // Second check: if the file exists, resolve symlinks and verify again
-    if (existsSync(resolved)) {
-      const realPath = realpathSync(resolved);
+    // Second check: resolve symlinks and verify the real path is still inside the vault.
+    // For existing files, check the file itself. For new files, check the parent directory
+    // (a symlinked directory could redirect writes outside the vault).
+    const targetToCheck = existsSync(resolved) ? resolved : path.dirname(resolved);
+    if (existsSync(targetToCheck)) {
+      const realPath = realpathSync(targetToCheck);
       if (!realPath.startsWith(this.vaultPath + path.sep) && realPath !== this.vaultPath) {
         throw new Error(`Symlink escape blocked: ${notePath} resolves to ${realPath}`);
       }
@@ -207,6 +210,24 @@ export class ObsidianVault {
     await fs.rename(fullPath, trashFullPath);
     const trashRelPath = path.relative(this.vaultPath, trashFullPath);
     return { path: notePath, trashPath: trashRelPath };
+  }
+
+  // ─── Attachments ─────────────────────────────────────────────────────────────
+
+  async uploadAttachment(
+    filePath: string,
+    data: Buffer,
+    options: { overwrite?: boolean } = {}
+  ): Promise<{ path: string; bytes: number }> {
+    const resolved = this.resolvePath(filePath);
+
+    if (existsSync(resolved) && !options.overwrite) {
+      throw new Error(`File already exists: ${filePath}. Set overwrite: true to replace.`);
+    }
+
+    await fs.mkdir(path.dirname(resolved), { recursive: true });
+    await fs.writeFile(resolved, data);
+    return { path: filePath, bytes: data.length };
   }
 
   // ─── Search ──────────────────────────────────────────────────────────────────

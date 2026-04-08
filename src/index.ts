@@ -1,16 +1,21 @@
 import 'dotenv/config';
 import express from 'express';
+import { timingSafeEqual } from 'crypto';
 
 // ─── Crash Protection ────────────────────────────────────────────────────────
-// Prevent the process from dying on unhandled errors
+// Log unhandled errors and exit. The process manager (pm2, Docker, s6) should
+// handle restarts. Continuing after an uncaught exception risks running in an
+// undefined state which could compromise security invariants.
 
 process.on('uncaughtException', (err) => {
   console.error(`[crash-guard] Uncaught exception: ${err.message}`);
   console.error(err.stack);
+  process.exit(1);
 });
 
 process.on('unhandledRejection', (reason) => {
   console.error(`[crash-guard] Unhandled rejection:`, reason);
+  process.exit(1);
 });
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
@@ -30,6 +35,9 @@ const DAILY_NOTE_FOLDER = process.env.DAILY_NOTE_FOLDER ?? 'Journal';
 const DAILY_NOTE_FORMAT = process.env.DAILY_NOTE_FORMAT ?? 'YYYY-MM-DD'; // e.g. 'MM-DD-YYYY DayOfWeek'
 const AUTH_TOKEN = process.env.AUTH_TOKEN; // optional bearer token
 const MAX_BODY_SIZE = process.env.MAX_BODY_SIZE ?? '1mb'; // #6: request size limit
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
+  : [];
 const SYNC_WAIT_TIMEOUT = parseInt(process.env.SYNC_WAIT_TIMEOUT ?? '300', 10); // seconds
 
 if (!VAULT_PATH) {
@@ -117,7 +125,16 @@ function authMiddleware(
 ) {
   if (!AUTH_TOKEN) return next(); // no auth configured → open (rely on network-level security)
   const header = req.headers.authorization ?? '';
-  if (header === `Bearer ${AUTH_TOKEN}`) return next();
+  const expected = `Bearer ${AUTH_TOKEN}`;
+  // Use timing-safe comparison to prevent token recovery via response-time analysis
+  const headerBuf = Buffer.from(header);
+  const expectedBuf = Buffer.from(expected);
+  if (
+    headerBuf.length === expectedBuf.length &&
+    timingSafeEqual(headerBuf, expectedBuf)
+  ) {
+    return next();
+  }
   res.status(401).json({ error: 'Unauthorized' });
 }
 
@@ -269,31 +286,15 @@ server.tool(
   },
   async ({ path: filePath, data, overwrite }, extra) => {
     const v = requireVault();
-    const vaultPath = (v as any).vaultPath as string;
-    const resolved = path.resolve(vaultPath, filePath);
-
-    // Path traversal protection
-    if (!resolved.startsWith(vaultPath + path.sep) && resolved !== vaultPath) {
-      throw new Error(`Path traversal attempt blocked: ${filePath}`);
-    }
-
-    if (existsSync(resolved) && !overwrite) {
-      throw new Error(`File already exists: ${filePath}. Set overwrite: true to replace.`);
-    }
-
-    // Ensure parent directory exists
-    await fs.mkdir(path.dirname(resolved), { recursive: true });
-
-    // Decode base64 and write
     const buffer = Buffer.from(data, 'base64');
-    await fs.writeFile(resolved, buffer);
+    const result = await v.uploadAttachment(filePath, buffer, { overwrite });
 
     auditLog('UPLOAD', filePath, extra.sessionId);
     return {
       content: [
         {
           type: 'text',
-          text: `✅ Uploaded: ${filePath} (${buffer.length} bytes)`,
+          text: `✅ Uploaded: ${result.path} (${result.bytes} bytes)`,
         },
       ],
     };
@@ -502,6 +503,41 @@ return server;
 // ─── HTTP / SSE Express Server ─────────────────────────────────────────────────
 
 const app = express();
+
+// ─── Origin Validation ────────────────────────────────────────────────────────
+// The MCP spec (2025-03-26, §Streamable HTTP) requires servers to validate the
+// Origin header to prevent DNS rebinding attacks. Registered first so invalid
+// origins are rejected before auth or rate-limit processing.
+
+const allowedOriginHostnames = new Set([
+  'localhost',
+  '127.0.0.1',
+  '::1',
+  ...ALLOWED_ORIGINS,
+]);
+
+function originCheckMiddleware(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  const origin = req.headers.origin;
+  // No Origin header → non-browser client (CLI, MCP SDK, etc.) — allow.
+  if (!origin) return next();
+
+  try {
+    const { hostname } = new URL(origin);
+    if (allowedOriginHostnames.has(hostname) || hostname.endsWith('.ts.net')) {
+      return next();
+    }
+  } catch {
+    // Malformed Origin — fall through to reject
+  }
+
+  res.status(403).json({ error: 'Forbidden: origin not allowed' });
+}
+
+app.use(originCheckMiddleware);
 
 // #6: Body size limit for non-SSE routes
 app.use('/health', express.json({ limit: MAX_BODY_SIZE }));

@@ -1,5 +1,6 @@
 # obsidian-mcp
 
+[![SafeSkill 93/100](https://img.shields.io/badge/SafeSkill-93%2F100_Verified%20Safe-brightgreen)](https://safeskill.dev/scan/meimakes-obsidian-mcp)
 MCP server that gives AI agents full access to your Obsidian vault. Runs locally or in the cloud with always-on access via Obsidian Sync.
 
 ## How it works

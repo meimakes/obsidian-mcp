@@ -318,6 +318,29 @@ server.tool(
   }
 );
 
+// ── edit_note ────────────────────────────────────────────────────────────────
+server.tool(
+  'edit_note',
+  'Search and replace text within a note. To insert new content, include surrounding text in old_text and add the new content in new_text. The old_text must appear exactly once. Backup created automatically.',
+  {
+    path: z.string().describe('Path to note relative to vault root, e.g. "Projects/todo.md"'),
+    old_text: z.string().describe('Exact text to find (must appear exactly once). Include surrounding context to make it unique. For insertions, include the text before and after where you want to insert.'),
+    new_text: z.string().describe('Replacement text. For insertions, include the original surrounding text with the new content added. Use empty string to delete.'),
+  },
+  async ({ path, old_text, new_text }, extra) => {
+    const result = await requireVault().editNote(path, old_text, new_text);
+    auditLog('EDIT', path, extra.sessionId);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `✅ Edited: ${result.path}` + (result.backedUp ? ` (backup: ${result.backupPath})` : ''),
+        },
+      ],
+    };
+  }
+);
+
 // ── delete_note ───────────────────────────────────────────────────────────────
 // #1: Soft-delete to .trash/ instead of hard unlink
 server.tool(

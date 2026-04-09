@@ -24,6 +24,12 @@ export interface WriteResult {
   backupPath?: string;
 }
 
+export interface EditResult {
+  path: string;
+  backedUp: boolean;
+  backupPath?: string;
+}
+
 export interface DeleteResult {
   path: string;
   trashPath?: string;
@@ -180,6 +186,53 @@ export class ObsidianVault {
     }
     const separator = content.startsWith('\n') ? '' : '\n';
     await fs.appendFile(fullPath, separator + content, 'utf-8');
+  }
+
+  async editNote(
+    notePath: string,
+    oldText: string,
+    newText: string
+  ): Promise<EditResult> {
+    const fullPath = this.resolvePath(notePath);
+
+    if (!existsSync(fullPath)) {
+      throw new Error(`Note not found: ${notePath}`);
+    }
+
+    const rawContent = await fs.readFile(fullPath, 'utf-8');
+
+    // Count occurrences — old_text must be unique
+    let count = 0;
+    let searchFrom = 0;
+    while (true) {
+      const idx = rawContent.indexOf(oldText, searchFrom);
+      if (idx === -1) break;
+      count++;
+      searchFrom = idx + oldText.length;
+    }
+
+    if (count === 0) {
+      throw new Error(
+        `edit_note failed: old_text not found in ${notePath}. Make sure the text matches exactly (including whitespace and newlines).`
+      );
+    }
+
+    if (count > 1) {
+      throw new Error(
+        `edit_note failed: old_text appears ${count} times in ${notePath}. Include more surrounding context to make it unique.`
+      );
+    }
+
+    // Backup before editing
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupPath = `${notePath}.${timestamp}.bak`;
+    const fullBackupPath = path.resolve(this.vaultPath, backupPath);
+    await fs.copyFile(fullPath, fullBackupPath);
+
+    const updatedContent = rawContent.replace(oldText, newText);
+    await fs.writeFile(fullPath, updatedContent, 'utf-8');
+
+    return { path: notePath, backedUp: true, backupPath };
   }
 
   // #1: Soft-delete to .trash/ by default
